@@ -13,7 +13,7 @@ import gettext
 import locale
 import os
 import shlex
-from configparser import ConfigParser, Error as ConfigParserError
+from configparser import ConfigParser, Error as ConfigParserError, SectionProxy
 from pathlib import Path
 
 from albert import *
@@ -38,16 +38,17 @@ def _data_dirs() -> list[Path]:
     return [Path(d) for d in [home, *dirs.split(":")] if d]
 
 
-def _locale_suffixes() -> list[str]:
-    """Desktop entry locale suffixes to try, most specific first (e.g. de_DE@euro, de_DE, de)."""
-    lang = None
+def _messages_locale() -> str:
+    """The locale used for messages, e.g. de_DE.UTF-8@euro."""
     for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
         if os.environ.get(var):
-            lang = os.environ[var]
-            break
-    if not lang:
-        lang = locale.getlocale(locale.LC_MESSAGES)[0] or ""
-    lang = lang.split(".")[0]  # drop encoding, keep @modifier handling below
+            return os.environ[var]
+    return locale.getlocale(locale.LC_MESSAGES)[0] or ""
+
+
+def _locale_suffixes() -> list[str]:
+    """Desktop entry locale suffixes to try, most specific first (e.g. de_DE@euro, de_DE, de)."""
+    lang = _messages_locale().split(".")[0]  # drop encoding, keep @modifier handling below
     modifier = ""
     if "@" in lang:
         lang, modifier = lang.split("@", 1)
@@ -113,86 +114,117 @@ class Panel(Item):
     def actions(self):
         return [Action("open", "Open", lambda: runDetachedProcess(self.command))]
 
+    def search_strings(self) -> list[str]:
+        # Like the shell search provider, match name, description and keywords
+        strings = [self.name, *self.keywords]
+        if self.comment:
+            strings.append(self.comment)
+        return strings
 
-def load_panels() -> list[Panel]:
-    current_desktops = {
-        d for d in os.environ.get("XDG_CURRENT_DESKTOP", "GNOME").lower().split(":") if d
-    }
-    suffixes = _locale_suffixes()
 
-    def localized(entry, key: str, domain: str | None) -> tuple[str, str]:
-        """Returns (untranslated, translated) value of **key**."""
-        raw = entry.get(key, "")
-        for s in suffixes:
-            if f"{key}[{s}]" in entry:
-                return raw, entry[f"{key}[{s}]"]
-        if raw and domain:
-            return raw, gettext.dgettext(domain, raw)
-        return raw, raw
+def _current_desktops() -> set[str]:
+    return {d for d in os.environ.get("XDG_CURRENT_DESKTOP", "GNOME").lower().split(":") if d}
 
-    panels: dict[str, Panel] = {}
-    seen_files: set[str] = set()
 
+def _desktop_files() -> list[Path]:
+    """All application desktop files, one per desktop file id."""
+    files: dict[str, Path] = {}
     for data_dir in _data_dirs():
         apps_dir = data_dir / "applications"
         if not apps_dir.is_dir():
             continue
         for path in sorted(apps_dir.glob("*.desktop")):
             # Files earlier in XDG_DATA_DIRS shadow later ones with the same id
-            if path.name in seen_files:
-                continue
-            seen_files.add(path.name)
+            files.setdefault(path.name, path)
+    return list(files.values())
 
-            parser = ConfigParser(interpolation=None, strict=False)
-            parser.optionxform = str
-            try:
-                parser.read(path, encoding="utf-8")
-            except (ConfigParserError, UnicodeDecodeError, OSError) as e:
-                debug(f"Skipping {path}: {e}")
-                continue
-            if not parser.has_section(DESKTOP_ENTRY):
-                continue
-            entry = parser[DESKTOP_ENTRY]
 
-            if PANEL_CATEGORY not in entry.get("Categories", "").split(";"):
-                continue
-            if entry.get("Hidden", "false").lower() == "true":
-                continue
-            if not _desktop_matches(entry, current_desktops):
-                continue
+def _read_desktop_entry(path: Path) -> SectionProxy | None:
+    parser = ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str
+    try:
+        parser.read(path, encoding="utf-8")
+    except (ConfigParserError, UnicodeDecodeError, OSError) as e:
+        debug(f"Skipping {path}: {e}")
+        return None
+    if not parser.has_section(DESKTOP_ENTRY):
+        return None
+    return parser[DESKTOP_ENTRY]
 
-            try:
-                command = [
-                    arg for arg in shlex.split(entry.get("Exec", ""))
-                    if not (len(arg) == 2 and arg.startswith("%"))
-                ]
-            except ValueError:
-                continue
-            if not command:
-                continue
 
-            domain = entry.get("X-Ubuntu-Gettext-Domain") or entry.get("X-GNOME-Gettext-Domain")
-            _, name = localized(entry, "Name", domain)
-            _, comment = localized(entry, "Comment", domain)
-            raw_kw, kw = localized(entry, "Keywords", domain)
+def _is_visible_panel(entry, current_desktops: set[str]) -> bool:
+    if PANEL_CATEGORY not in entry.get("Categories", "").split(";"):
+        return False
+    if entry.get("Hidden", "false").lower() == "true":
+        return False
+    return _desktop_matches(entry, current_desktops)
 
-            keywords = []
-            for k in [*kw.split(";"), *raw_kw.split(";")]:
-                k = k.strip()
-                if k and k not in keywords:
-                    keywords.append(k)
 
-            panel_id = path.name.removesuffix(".desktop")
-            panels[panel_id] = Panel(
-                panel_id=panel_id,
-                name=name,
-                comment=comment,
-                icon_name=entry.get("Icon", ""),
-                command=command,
-                keywords=keywords,
-            )
+def _exec_command(entry) -> list[str]:
+    """The Exec key as an argument list with field codes (%f, %U, ...) removed, empty if invalid."""
+    try:
+        args = shlex.split(entry.get("Exec", ""))
+    except ValueError:
+        return []
+    return [arg for arg in args if not (len(arg) == 2 and arg.startswith("%"))]
 
-    return sorted(panels.values(), key=lambda p: p.name.lower())
+
+def _localized(entry, key: str, domain: str | None, suffixes: list[str]) -> tuple[str, str]:
+    """Returns (untranslated, translated) value of **key**."""
+    raw = entry.get(key, "")
+    for s in suffixes:
+        if f"{key}[{s}]" in entry:
+            return raw, entry[f"{key}[{s}]"]
+    if raw and domain:
+        return raw, gettext.dgettext(domain, raw)
+    return raw, raw
+
+
+def _merge_keywords(*keyword_lists: str) -> list[str]:
+    """Merges ;-separated keyword lists, dropping blanks and duplicates."""
+    keywords = []
+    for keyword_list in keyword_lists:
+        for k in keyword_list.split(";"):
+            k = k.strip()
+            if k and k not in keywords:
+                keywords.append(k)
+    return keywords
+
+
+def _panel_from_entry(panel_id: str, entry, suffixes: list[str]) -> Panel | None:
+    command = _exec_command(entry)
+    if not command:
+        return None
+
+    domain = entry.get("X-Ubuntu-Gettext-Domain") or entry.get("X-GNOME-Gettext-Domain")
+    _, name = _localized(entry, "Name", domain, suffixes)
+    _, comment = _localized(entry, "Comment", domain, suffixes)
+    raw_kw, kw = _localized(entry, "Keywords", domain, suffixes)
+
+    return Panel(
+        panel_id=panel_id,
+        name=name,
+        comment=comment,
+        icon_name=entry.get("Icon", ""),
+        command=command,
+        keywords=_merge_keywords(kw, raw_kw),
+    )
+
+
+def load_panels() -> list[Panel]:
+    current_desktops = _current_desktops()
+    suffixes = _locale_suffixes()
+
+    panels = []
+    for path in _desktop_files():
+        entry = _read_desktop_entry(path)
+        if entry is None or not _is_visible_panel(entry, current_desktops):
+            continue
+        panel = _panel_from_entry(path.name.removesuffix(".desktop"), entry, suffixes)
+        if panel is not None:
+            panels.append(panel)
+
+    return sorted(panels, key=lambda p: p.name.lower())
 
 
 class Plugin(PluginInstance, IndexQueryHandler):
@@ -210,11 +242,6 @@ class Plugin(PluginInstance, IndexQueryHandler):
     def updateIndexItems(self):
         panels = load_panels()
         debug(f"Indexed {len(panels)} settings panels")
-        index_items = []
-        for panel in panels:
-            # Like the shell search provider, match name, description and keywords
-            strings = [panel.name, *panel.keywords]
-            if panel.comment:
-                strings.append(panel.comment)
-            index_items += [IndexItem(item=panel, string=s) for s in strings]
-        self.setIndexItems(index_items)
+        self.setIndexItems([
+            IndexItem(item=panel, string=s) for panel in panels for s in panel.search_strings()
+        ])
