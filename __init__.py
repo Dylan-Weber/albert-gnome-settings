@@ -48,10 +48,11 @@ def _messages_locale() -> str:
 
 def _locale_suffixes() -> list[str]:
     """Desktop entry locale suffixes to try, most specific first (e.g. de_DE@euro, de_DE, de)."""
-    lang = _messages_locale().split(".")[0]  # drop encoding, keep @modifier handling below
+    lang = _messages_locale()
     modifier = ""
-    if "@" in lang:
+    if "@" in lang:  # the modifier comes last, after the encoding: sr_RS.UTF-8@latin
         lang, modifier = lang.split("@", 1)
+    lang = lang.split(".")[0]  # drop the encoding
     base = lang.split("_")[0]
     candidates = []
     if modifier:
