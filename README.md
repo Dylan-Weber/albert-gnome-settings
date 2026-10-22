@@ -15,3 +15,14 @@ ln -s "$PWD" ~/.local/share/albert/python/plugins/gnome_settings
 ```
 
 Then enable *GNOME Settings* under Albert → Settings → Plugins → Python.
+
+## Tests
+
+The tests run without Albert, using a fake `albert` module, and only need Python's standard library:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+One smoke test also loads the panels installed on the system and is skipped where GNOME Settings is
+not installed.
